@@ -1,0 +1,36 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pytest*)",
+      "Bash(python*)",
+      "Bash(pip*)",
+      "Bash(make*)",
+      "Bash(redis-cli*)",
+      "Bash(curl*)",
+      "Bash(git *)",
+      "Bash(git reset*)",
+      "Bash(git add*)",
+      "Bash(git status*)",
+      "Bash(git commit*)",
+      "Bash(git push*)",
+      "Bash(git pull*)",
+      "Bash(git checkout*)",
+      "Bash(git branch*)",
+      "Bash(git diff*)",
+      "Bash(git log*)",
+      "Read",
+      "Write",
+      "Edit"
+    ],
+    "deny": [
+      "Bash(rm -rf /)",
+      "Bash(*sudo*)",
+      "Bash(*DROP TABLE*)",
+      "Bash(*DELETE FROM*)"
+    ]
+  },
+  "env": {
+    "PYTHONPATH": "${workspaceFolder}/src",
+    "ENV": "development"
+  }
+}
