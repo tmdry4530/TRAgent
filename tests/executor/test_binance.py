@@ -410,20 +410,18 @@ class TestExecuteSignal:
         }
 
         with patch.object(executor, "_request", new_callable=AsyncMock) as mock_req:
-            mock_req.side_effect = [leverage_resp, entry_resp, sl_resp, tp_resp]
+            # Only entry order is placed now (SL/TP managed by price monitoring)
+            mock_req.side_effect = [leverage_resp, entry_resp]
 
-            entry, sl, tp = await executor.execute_signal(
+            entry = await executor.execute_signal(
                 signal=sample_signal,
                 position_size=1.0,
                 account_balance=10000.0,
             )
 
+            # execute_signal now returns single OrderResult (entry only)
             assert entry is not None
             assert entry.order_id == "100"
-            assert sl is not None
-            assert sl.order_id == "101"
-            assert tp is not None
-            assert tp.order_id == "102"
 
     @pytest.mark.asyncio
     async def test_execute_signal_quantity_too_small(self, executor, sample_signal):
@@ -434,16 +432,14 @@ class TestExecuteSignal:
         with patch.object(executor, "set_leverage", new_callable=AsyncMock) as mock_lev:
             mock_lev.return_value = True
 
-            entry, sl, tp = await executor.execute_signal(
+            result = await executor.execute_signal(
                 signal=sample_signal,
                 position_size=0.00001,  # Very small size
                 account_balance=1.0,  # Very small balance
             )
 
-            # Should return None for all due to quantity too small
-            assert entry is None
-            assert sl is None
-            assert tp is None
+            # Should return None due to quantity too small
+            assert result is None
 
 
 class TestClosePosition:

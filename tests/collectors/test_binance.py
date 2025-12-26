@@ -27,6 +27,7 @@ class TestKlineData:
         """Test creating a KlineData instance."""
         kline = KlineData(
             timestamp=datetime(2025, 1, 1, 12, 0, 0),
+            symbol="BTCUSDT",
             open=50000.0,
             high=50100.0,
             low=49900.0,
@@ -35,6 +36,7 @@ class TestKlineData:
             interval="1m",
             is_closed=True,
         )
+        assert kline.symbol == "BTCUSDT"
         assert kline.open == 50000.0
         assert kline.high == 50100.0
         assert kline.low == 49900.0
@@ -73,10 +75,11 @@ class TestBinanceWebSocketCollector:
         with patch("src.collectors.binance.get_settings") as mock_settings:
             mock_settings.return_value = MagicMock(
                 trading_symbol="BTCUSDT",
+                trading_symbols=["BTCUSDT"],
                 binance_ws_url="wss://fstream.binance.com",
                 binance_testnet=False,
             )
-            return BinanceWebSocketCollector()
+            return BinanceWebSocketCollector(symbols=["BTCUSDT"])
 
     def test_initial_state(self, collector: BinanceWebSocketCollector) -> None:
         """Test initial state of collector."""
@@ -164,6 +167,7 @@ class TestBinanceWebSocketCollector:
 
         # Simulate kline message
         kline_data = {
+            "s": "BTCUSDT",
             "k": {
                 "t": 1735689600000,  # 2025-01-01 00:00:00
                 "o": "50000.00",
@@ -181,6 +185,7 @@ class TestBinanceWebSocketCollector:
         callback.assert_called_once()
         kline = callback.call_args[0][0]
         assert isinstance(kline, KlineData)
+        assert kline.symbol == "BTCUSDT"
         assert kline.open == 50000.0
         assert kline.is_closed is True
 
@@ -223,6 +228,7 @@ class TestBinanceWebSocketCollector:
             {
                 "stream": "btcusdt@kline_1m",
                 "data": {
+                    "s": "BTCUSDT",
                     "k": {
                         "t": 1735689600000,
                         "o": "50000.00",

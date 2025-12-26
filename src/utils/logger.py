@@ -20,6 +20,11 @@ def configure_logging() -> None:
         level=getattr(logging, settings.log_level),
     )
 
+    # Suppress noisy third-party loggers
+    logging.getLogger("websockets").setLevel(logging.WARNING)
+    logging.getLogger("websockets.client").setLevel(logging.WARNING)
+    logging.getLogger("aiohttp").setLevel(logging.WARNING)
+
     # Shared processors for all outputs
     shared_processors: list[Any] = [
         structlog.contextvars.merge_contextvars,

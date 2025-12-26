@@ -136,10 +136,10 @@ class TestWickReversalPipeline:
 
     @pytest.fixture
     def signal_generator(self) -> WickReversalSignal:
-        """Create signal generator."""
+        """Create signal generator with RSI disabled for testing."""
         with patch("src.signals.scalp.get_settings") as mock_settings:
             mock_settings.return_value = MagicMock()
-            return WickReversalSignal()
+            return WickReversalSignal(rsi_enabled=False, atr_enabled=False)
 
     async def _run_pipeline(
         self,
@@ -328,10 +328,10 @@ class TestExitConditions:
 
     @pytest.fixture
     def signal_generator(self) -> WickReversalSignal:
-        """Create signal generator."""
+        """Create signal generator with RSI disabled for testing."""
         with patch("src.signals.scalp.get_settings") as mock_settings:
             mock_settings.return_value = MagicMock()
-            return WickReversalSignal()
+            return WickReversalSignal(rsi_enabled=False, atr_enabled=False)
 
     def test_time_based_exit(self, signal_generator: WickReversalSignal) -> None:
         """Test time-based exit triggering."""
@@ -348,15 +348,25 @@ class TestExitConditions:
 
     def test_volume_based_exit(self, signal_generator: WickReversalSignal) -> None:
         """Test volume-based exit triggering."""
+        # Entry 1 minute ago - should allow volume exit
+        signal_generator._last_signal_context = WickSignalContext(
+            wick_low=50000.0,
+            wick_high=50100.0,
+            entry_time=datetime.now(timezone.utc) - timedelta(seconds=60),
+            volume_threshold=200.0,
+        )
+
+        assert signal_generator.should_exit_on_volume(250.0) is True
+        assert signal_generator.should_exit_on_volume(150.0) is False
+
+        # Entry just now - should not trigger volume exit (min holding time)
         signal_generator._last_signal_context = WickSignalContext(
             wick_low=50000.0,
             wick_high=50100.0,
             entry_time=datetime.now(timezone.utc),
             volume_threshold=200.0,
         )
-
-        assert signal_generator.should_exit_on_volume(250.0) is True
-        assert signal_generator.should_exit_on_volume(150.0) is False
+        assert signal_generator.should_exit_on_volume(250.0) is False
 
 
 class TestMultipleScenarios:
@@ -368,9 +378,10 @@ class TestMultipleScenarios:
 
     @pytest.fixture
     def signal_generator(self) -> WickReversalSignal:
+        """Create signal generator with RSI disabled for testing."""
         with patch("src.signals.scalp.get_settings") as mock_settings:
             mock_settings.return_value = MagicMock()
-            return WickReversalSignal()
+            return WickReversalSignal(rsi_enabled=False, atr_enabled=False)
 
     @pytest.mark.asyncio
     async def test_trading_session_simulation(
@@ -482,7 +493,7 @@ class TestMultipleScenarios:
         """Test that generated signals are valid."""
         with patch("src.signals.scalp.get_settings") as mock_settings:
             mock_settings.return_value = MagicMock()
-            signal_generator = WickReversalSignal()
+            signal_generator = WickReversalSignal(rsi_enabled=False, atr_enabled=False)
 
         market_gen = MockMarketDataGenerator()
 

@@ -48,8 +48,15 @@ class Position:
     # Trailing stop
     trailing_stop_enabled: bool = False
     trailing_stop_distance: float = 0.0
+    trailing_stop_activated: bool = False
     highest_price: float = 0.0  # For LONG trailing
     lowest_price: float = float("inf")  # For SHORT trailing
+
+    # Partial take profit
+    partial_tp_enabled: bool = False
+    partial_tp_pct: float = 0.5  # Close 50% at first TP
+    partial_tp_triggered: bool = False
+    original_quantity: float = 0.0  # Track original size for partial exit
 
     # Metadata
     signal_reason: str = ""
@@ -105,6 +112,96 @@ class Position:
             pnl_pct = (self.entry_price - current_price) / self.entry_price
         return pnl_pct
 
+    def check_partial_tp(self, current_price: float) -> Optional[float]:
+        """Check if partial take profit should trigger.
+
+        Partial TP triggers when price reaches 50% of the way to TP.
+
+        Args:
+            current_price: Current market price
+
+        Returns:
+            Quantity to close if partial TP triggered, None otherwise
+        """
+        if not self.partial_tp_enabled or self.partial_tp_triggered:
+            return None
+
+        # Calculate progress toward TP (0.0 to 1.0)
+        if self.is_long:
+            total_distance = self.take_profit - self.entry_price
+            current_progress = current_price - self.entry_price
+        else:
+            total_distance = self.entry_price - self.take_profit
+            current_progress = self.entry_price - current_price
+
+        if total_distance <= 0:
+            return None
+
+        progress_pct = current_progress / total_distance
+
+        # Trigger at 50% progress toward TP
+        if progress_pct >= 0.5:
+            self.partial_tp_triggered = True
+            close_quantity = self.quantity * self.partial_tp_pct
+            # Update remaining quantity
+            self.quantity = self.quantity - close_quantity
+
+            logger.info(
+                "Partial take profit triggered",
+                position_id=self.id,
+                progress_pct=f"{progress_pct:.1%}",
+                close_quantity=close_quantity,
+                remaining_quantity=self.quantity,
+            )
+
+            return close_quantity
+
+        return None
+
+    def activate_trailing_stop(self, current_price: float, activation_pct: float = 0.01) -> bool:
+        """Check if trailing stop should be activated.
+
+        Trailing stop activates when profit reaches activation threshold.
+        When activated, also sets the initial trailing stop loss level.
+
+        Args:
+            current_price: Current market price
+            activation_pct: Profit percentage to activate (default: 1%)
+
+        Returns:
+            True if just activated, False otherwise
+        """
+        if not self.trailing_stop_enabled or self.trailing_stop_activated:
+            return False
+
+        pnl_pct = self.calculate_pnl_pct(current_price)
+
+        if pnl_pct >= activation_pct:
+            self.trailing_stop_activated = True
+
+            # Set highest/lowest price and initial trailing stop
+            if self.is_long:
+                self.highest_price = current_price
+                new_sl = current_price * (1 - self.trailing_stop_distance)
+                if new_sl > self.stop_loss:
+                    self.stop_loss = new_sl
+            else:
+                self.lowest_price = current_price
+                new_sl = current_price * (1 + self.trailing_stop_distance)
+                if new_sl < self.stop_loss:
+                    self.stop_loss = new_sl
+
+            logger.info(
+                "Trailing stop activated",
+                position_id=self.id,
+                pnl_pct=f"{pnl_pct:.2%}",
+                current_price=current_price,
+                new_stop_loss=self.stop_loss,
+            )
+            return True
+
+        return False
+
     def update_trailing_stop(self, current_price: float) -> Optional[float]:
         """Update trailing stop based on current price.
 
@@ -114,7 +211,7 @@ class Position:
         Returns:
             New stop loss price if updated, None otherwise
         """
-        if not self.trailing_stop_enabled:
+        if not self.trailing_stop_enabled or not self.trailing_stop_activated:
             return None
 
         old_sl = self.stop_loss
@@ -217,6 +314,13 @@ class PositionManager:
         self,
         max_scalp_positions: int = 1,
         max_swing_positions: int = 1,
+        # Scalp settings
+        scalp_trailing_enabled: bool = True,
+        scalp_trailing_distance: float = 0.003,  # 0.3% for scalp
+        scalp_trailing_activation_pct: float = 0.005,  # Activate after 0.5% profit
+        scalp_partial_tp_enabled: bool = True,
+        scalp_partial_tp_pct: float = 0.5,  # Close 50% at first TP
+        # Swing settings
         swing_trailing_stop_distance: float = 0.02,  # 2% for swing
         swing_trailing_activation_pct: float = 0.01,  # Activate after 1% profit
     ) -> None:
@@ -225,11 +329,25 @@ class PositionManager:
         Args:
             max_scalp_positions: Maximum concurrent scalp positions
             max_swing_positions: Maximum concurrent swing positions
+            scalp_trailing_enabled: Enable trailing stop for scalp
+            scalp_trailing_distance: Trailing distance for scalp (percentage)
+            scalp_trailing_activation_pct: Profit % to activate scalp trailing
+            scalp_partial_tp_enabled: Enable partial TP for scalp
+            scalp_partial_tp_pct: Portion to close at partial TP
             swing_trailing_stop_distance: Trailing distance for swing (percentage)
             swing_trailing_activation_pct: Profit % to activate trailing stop
         """
         self.max_scalp_positions = max_scalp_positions
         self.max_swing_positions = max_swing_positions
+
+        # Scalp settings
+        self.scalp_trailing_enabled = scalp_trailing_enabled
+        self.scalp_trailing_distance = scalp_trailing_distance
+        self.scalp_trailing_activation_pct = scalp_trailing_activation_pct
+        self.scalp_partial_tp_enabled = scalp_partial_tp_enabled
+        self.scalp_partial_tp_pct = scalp_partial_tp_pct
+
+        # Swing settings
         self.swing_trailing_stop_distance = swing_trailing_stop_distance
         self.swing_trailing_activation_pct = swing_trailing_activation_pct
 
@@ -350,10 +468,23 @@ class PositionManager:
             leverage=leverage,
             entry_order_id=entry_order_id,
             signal_reason=signal.reason,
+            original_quantity=quantity,  # Track original for partial TP
         )
 
-        # Enable trailing stop for swing positions
-        if signal.type == "SWING":
+        # Configure position based on signal type
+        if signal.type == "SCALP":
+            # Enable trailing stop for scalp
+            if self.scalp_trailing_enabled:
+                position.trailing_stop_enabled = True
+                position.trailing_stop_distance = self.scalp_trailing_distance
+                position.highest_price = signal.entry_price
+                position.lowest_price = signal.entry_price
+            # Enable partial take profit for scalp
+            if self.scalp_partial_tp_enabled:
+                position.partial_tp_enabled = True
+                position.partial_tp_pct = self.scalp_partial_tp_pct
+        elif signal.type == "SWING":
+            # Enable trailing stop for swing positions
             position.trailing_stop_enabled = True
             position.trailing_stop_distance = self.swing_trailing_stop_distance
             position.highest_price = signal.entry_price
@@ -441,14 +572,24 @@ class PositionManager:
             if not position.trailing_stop_enabled:
                 continue
 
-            # Check if trailing stop should activate (after profit threshold)
-            pnl_pct = position.calculate_pnl_pct(current_price)
+            # Use appropriate activation threshold based on position type
+            if position.is_scalp:
+                activation_pct = self.scalp_trailing_activation_pct
+            else:
+                activation_pct = self.swing_trailing_activation_pct
 
-            if pnl_pct < self.swing_trailing_activation_pct:
-                continue
+            # Track previous stop loss for detecting changes
+            old_sl = position.stop_loss
 
-            # Update trailing stop
+            # Activate trailing stop if not already activated and threshold reached
+            just_activated = position.activate_trailing_stop(current_price, activation_pct)
+
+            # Update trailing stop (only works if activated)
             new_sl = position.update_trailing_stop(current_price)
+
+            # Check if SL changed (either from activation or update)
+            if just_activated and position.stop_loss != old_sl:
+                new_sl = position.stop_loss
 
             if new_sl:
                 updates.append((position, new_sl))

@@ -141,6 +141,7 @@ class TestPosition:
             direction="LONG", entry_price=50000.0, quantity=0.1,
             stop_loss=47500.0, take_profit=57500.0, leverage=10,
             trailing_stop_enabled=True,
+            trailing_stop_activated=True,  # Must be activated
             trailing_stop_distance=0.02,
             highest_price=50000.0,
         )
@@ -160,6 +161,7 @@ class TestPosition:
             direction="SHORT", entry_price=50000.0, quantity=0.1,
             stop_loss=52500.0, take_profit=42500.0, leverage=10,
             trailing_stop_enabled=True,
+            trailing_stop_activated=True,  # Must be activated
             trailing_stop_distance=0.02,
             lowest_price=50000.0,
         )

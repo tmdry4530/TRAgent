@@ -58,6 +58,9 @@ class WickReversalSignal(BaseSignalGenerator):
        - 롱: 긴 아래꼬리 (하락 후 반등)
        - 숏: 긴 위꼬리 (상승 후 하락)
     3. 추세-시그널 방향 일치
+    4. RSI 필터:
+       - 롱: RSI < 40 (과매도 영역)
+       - 숏: RSI > 60 (과매수 영역)
 
     손절:
     - 롱: 꼬리 저점 - 0.1%
@@ -71,14 +74,47 @@ class WickReversalSignal(BaseSignalGenerator):
 
     # 상수
     EMA_PERIOD = 20
-    VOLUME_MULTIPLIER = 3.0  # 진입용 거래량 배수
+    RSI_PERIOD = 14
+    ATR_PERIOD = 14  # ATR 계산 기간
+    RSI_OVERSOLD = 40  # 롱 진입 허용 RSI 상한
+    RSI_OVERBOUGHT = 60  # 숏 진입 허용 RSI 하한
+    VOLUME_MULTIPLIER = 2.0  # 진입용 거래량 배수
     WICK_RATIO_THRESHOLD = 0.6  # 꼬리 비율 임계값 (60%)
-    STOP_LOSS_BUFFER = 0.001  # 0.1% 손절 버퍼
+    STOP_LOSS_BUFFER = 0.001  # 0.1% 손절 버퍼 (ATR 사용 안할 때)
+    ATR_SL_MULTIPLIER = 1.5  # ATR x 1.5 = Stop Loss
+    ATR_TP_MULTIPLIER = 3.0  # ATR x 3.0 = Take Profit (RR 1:2)
     MAX_CANDLES = 100  # 최대 캔들 저장 수
 
-    def __init__(self) -> None:
-        """Initialize Wick Reversal signal generator."""
+    def __init__(
+        self,
+        rsi_enabled: bool = True,
+        rsi_oversold: float = 40,
+        rsi_overbought: float = 60,
+        atr_enabled: bool = True,
+        atr_sl_multiplier: float = 1.5,
+        atr_tp_multiplier: float = 3.0,
+    ) -> None:
+        """Initialize Wick Reversal signal generator.
+
+        Args:
+            rsi_enabled: Whether to use RSI filter
+            rsi_oversold: RSI threshold for long entries (default: 40)
+            rsi_overbought: RSI threshold for short entries (default: 60)
+            atr_enabled: Whether to use ATR-based SL/TP
+            atr_sl_multiplier: ATR multiplier for stop loss (default: 1.5)
+            atr_tp_multiplier: ATR multiplier for take profit (default: 3.0)
+        """
         self.settings = get_settings()
+
+        # RSI 설정
+        self.rsi_enabled = rsi_enabled
+        self.RSI_OVERSOLD = rsi_oversold
+        self.RSI_OVERBOUGHT = rsi_overbought
+
+        # ATR 설정
+        self.atr_enabled = atr_enabled
+        self.ATR_SL_MULTIPLIER = atr_sl_multiplier
+        self.ATR_TP_MULTIPLIER = atr_tp_multiplier
 
         # 캔들 데이터 저장소
         self._candles_1m: deque[CandleData] = deque(maxlen=self.MAX_CANDLES)
@@ -87,11 +123,17 @@ class WickReversalSignal(BaseSignalGenerator):
         # 마지막 시그널 컨텍스트 (포지션 관리용)
         self._last_signal_context: Optional[WickSignalContext] = None
 
-        logger.info(
+        logger.debug(
             "WickReversalSignal initialized",
             ema_period=self.EMA_PERIOD,
             volume_multiplier=self.VOLUME_MULTIPLIER,
             wick_ratio=self.WICK_RATIO_THRESHOLD,
+            rsi_enabled=self.rsi_enabled,
+            rsi_oversold=self.RSI_OVERSOLD,
+            rsi_overbought=self.RSI_OVERBOUGHT,
+            atr_enabled=self.atr_enabled,
+            atr_sl_mult=self.ATR_SL_MULTIPLIER,
+            atr_tp_mult=self.ATR_TP_MULTIPLIER,
         )
 
     @property
@@ -134,6 +176,137 @@ class WickReversalSignal(BaseSignalGenerator):
         df = pd.DataFrame({"close": closes})
         ema = df["close"].ewm(span=period, adjust=False).mean()
         return float(ema.iloc[-1])
+
+    def _calculate_rsi(self, candles: list[CandleData], period: int = 14) -> Optional[float]:
+        """Calculate RSI from candle closes.
+
+        Args:
+            candles: List of candles
+            period: RSI period (default: 14)
+
+        Returns:
+            RSI value (0-100) or None if insufficient data
+        """
+        if len(candles) < period + 1:
+            return None
+
+        closes = [c.close for c in candles[-(period + 10) :]]  # Extra for accuracy
+        if len(closes) < period + 1:
+            return None
+
+        df = pd.DataFrame({"close": closes})
+        delta = df["close"].diff().dropna()
+
+        if len(delta) < period:
+            return None
+
+        gain = delta.where(delta > 0, 0.0)
+        loss = (-delta).where(delta < 0, 0.0)
+
+        # Use simple moving average for first calculation, then EWM
+        first_avg_gain = gain.iloc[:period].mean()
+        first_avg_loss = loss.iloc[:period].mean()
+
+        if first_avg_loss == 0:
+            return 100.0 if first_avg_gain > 0 else 50.0
+
+        # Calculate RSI using Wilder's smoothing
+        avg_gain = first_avg_gain
+        avg_loss = first_avg_loss
+
+        for i in range(period, len(gain)):
+            avg_gain = (avg_gain * (period - 1) + gain.iloc[i]) / period
+            avg_loss = (avg_loss * (period - 1) + loss.iloc[i]) / period
+
+        if avg_loss == 0:
+            return 100.0
+
+        rs = avg_gain / avg_loss
+        rsi = 100 - (100 / (1 + rs))
+
+        return float(rsi)
+
+    def _check_rsi_filter(
+        self, candles_1m: list[CandleData], direction: str
+    ) -> tuple[bool, float]:
+        """Check RSI filter for entry.
+
+        Args:
+            candles_1m: List of 1m candles
+            direction: LONG or SHORT
+
+        Returns:
+            Tuple of (passes_filter, rsi_value)
+        """
+        if not self.rsi_enabled:
+            return True, 50.0  # Neutral RSI if disabled
+
+        rsi = self._calculate_rsi(candles_1m, self.RSI_PERIOD)
+        if rsi is None:
+            logger.debug("Insufficient data for RSI calculation")
+            return False, 0.0
+
+        if direction == "LONG":
+            # Long: RSI should be below oversold threshold
+            passes = rsi < self.RSI_OVERSOLD
+            if not passes:
+                logger.debug(
+                    "RSI filter blocked LONG",
+                    rsi=rsi,
+                    threshold=self.RSI_OVERSOLD,
+                )
+        else:
+            # Short: RSI should be above overbought threshold
+            passes = rsi > self.RSI_OVERBOUGHT
+            if not passes:
+                logger.debug(
+                    "RSI filter blocked SHORT",
+                    rsi=rsi,
+                    threshold=self.RSI_OVERBOUGHT,
+                )
+
+        return passes, rsi
+
+    def _calculate_atr(self, candles: list[CandleData], period: int = 14) -> Optional[float]:
+        """Calculate Average True Range (ATR) from candles.
+
+        ATR measures volatility using high, low, and close prices.
+        TR = max(high - low, abs(high - prev_close), abs(low - prev_close))
+        ATR = SMA(TR, period)
+
+        Args:
+            candles: List of candles
+            period: ATR period (default: 14)
+
+        Returns:
+            ATR value or None if insufficient data
+        """
+        if len(candles) < period + 1:
+            return None
+
+        # Calculate True Range for each candle
+        true_ranges: list[float] = []
+
+        for i in range(1, len(candles)):
+            high = candles[i].high
+            low = candles[i].low
+            prev_close = candles[i - 1].close
+
+            tr = max(
+                high - low,
+                abs(high - prev_close),
+                abs(low - prev_close),
+            )
+            true_ranges.append(tr)
+
+        if len(true_ranges) < period:
+            return None
+
+        # Calculate ATR using simple moving average of last 'period' true ranges
+        recent_tr = true_ranges[-period:]
+        atr = sum(recent_tr) / len(recent_tr)
+
+        return atr
 
     def _get_trend(self, candles_15m: list[CandleData]) -> Optional[Literal["UP", "DOWN"]]:
         """Determine trend from 15m candles using EMA(20).
@@ -370,21 +543,42 @@ class WickReversalSignal(BaseSignalGenerator):
             )
             return None
 
-        # 5. Calculate entry/exit prices
+        # 5. Check RSI filter
+        rsi_passes, rsi_value = self._check_rsi_filter(candles_1m, direction)
+        if not rsi_passes:
+            logger.debug(
+                "RSI filter rejected signal",
+                direction=direction,
+                rsi=rsi_value,
+            )
+            return None
+
+        # 6. Calculate entry/exit prices
         entry_price = current_price
 
+        # Calculate ATR for dynamic SL/TP
+        atr = self._calculate_atr(candles_1m, self.ATR_PERIOD) if self.atr_enabled else None
+
         if direction == "LONG":
-            # 손절: 꼬리 저점 - 0.1%
-            stop_loss = latest_candle.low * (1 - self.STOP_LOSS_BUFFER)
-            # 익절: 손익비 1:2 기준 (동적 익절은 포지션 관리자에서 처리)
-            risk = entry_price - stop_loss
-            take_profit = entry_price + (risk * 2)
+            if atr and self.atr_enabled:
+                # ATR 기반 동적 SL/TP
+                stop_loss = entry_price - (atr * self.ATR_SL_MULTIPLIER)
+                take_profit = entry_price + (atr * self.ATR_TP_MULTIPLIER)
+            else:
+                # 꼬리 기반 고정 SL/TP (fallback)
+                stop_loss = latest_candle.low * (1 - self.STOP_LOSS_BUFFER)
+                risk = entry_price - stop_loss
+                take_profit = entry_price + (risk * 2)
         else:
-            # 손절: 꼬리 고점 + 0.1%
-            stop_loss = latest_candle.high * (1 + self.STOP_LOSS_BUFFER)
-            # 익절: 손익비 1:2 기준
-            risk = stop_loss - entry_price
-            take_profit = entry_price - (risk * 2)
+            if atr and self.atr_enabled:
+                # ATR 기반 동적 SL/TP
+                stop_loss = entry_price + (atr * self.ATR_SL_MULTIPLIER)
+                take_profit = entry_price - (atr * self.ATR_TP_MULTIPLIER)
+            else:
+                # 꼬리 기반 고정 SL/TP (fallback)
+                stop_loss = latest_candle.high * (1 + self.STOP_LOSS_BUFFER)
+                risk = stop_loss - entry_price
+                take_profit = entry_price - (risk * 2)
 
         # Calculate confidence based on wick strength and volume
         wick_strength = max(lower_ratio, upper_ratio)
@@ -401,10 +595,13 @@ class WickReversalSignal(BaseSignalGenerator):
             volume_threshold=self._get_volume_exit_threshold(candles_1m),
         )
 
+        # Build reason string
+        atr_info = f", ATR ${atr:.2f}" if atr else ""
         reason = (
             f"Wick reversal: {trend} trend + "
             f"{'lower' if wick_type == 'LOWER' else 'upper'} wick "
-            f"({wick_strength:.1%}), volume {volume_ratio:.1f}x avg"
+            f"({wick_strength:.1%}), volume {volume_ratio:.1f}x avg, "
+            f"RSI {rsi_value:.1f}{atr_info}"
         )
 
         signal = Signal(
@@ -425,6 +622,8 @@ class WickReversalSignal(BaseSignalGenerator):
             wick_type=wick_type,
             wick_ratio=wick_strength,
             volume_ratio=volume_ratio,
+            rsi=rsi_value,
+            atr=atr,
             confidence=confidence,
             entry=entry_price,
             sl=stop_loss,
@@ -441,17 +640,24 @@ class WickReversalSignal(BaseSignalGenerator):
         """
         return self._last_signal_context
 
-    def should_exit_on_volume(self, current_volume: float) -> bool:
+    def should_exit_on_volume(self, current_volume: float, min_holding_seconds: int = 30) -> bool:
         """Check if should exit based on volume spike.
 
         Args:
             current_volume: Current candle volume
+            min_holding_seconds: Minimum seconds to hold before volume exit (default: 30)
 
         Returns:
             True if should exit
         """
         if self._last_signal_context is None:
             return False
+
+        # Don't trigger volume exit too early (avoid exiting on entry candle)
+        time_held = (datetime.now(timezone.utc) - self._last_signal_context.entry_time).total_seconds()
+        if time_held < min_holding_seconds:
+            return False
+
         return current_volume >= self._last_signal_context.volume_threshold
 
     def should_exit_on_time(self, max_minutes: int = 5) -> bool:

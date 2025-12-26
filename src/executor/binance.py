@@ -781,6 +781,7 @@ class BinanceExecutor:
         account_balance: float = 0.0,
         quantity: Optional[float] = None,
         leverage: Optional[int] = None,
+        symbol: Optional[str] = None,
     ) -> Optional[OrderResult]:
         """Execute a trading signal with market entry order.
 
@@ -793,10 +794,12 @@ class BinanceExecutor:
             account_balance: Current account balance, ignored if quantity provided
             quantity: Direct quantity to trade (overrides position_size calculation)
             leverage: Leverage to use (overrides default)
+            symbol: Trading symbol (default: configured symbol)
 
         Returns:
             Entry order result
         """
+        symbol = symbol or self.symbol
         # Determine leverage
         if leverage is None:
             if signal.type == "SCALP":
@@ -805,7 +808,7 @@ class BinanceExecutor:
                 leverage = self.settings.swing_leverage
 
         # Set leverage
-        await self.set_leverage(leverage)
+        await self.set_leverage(leverage, symbol)
 
         # Calculate quantity if not provided directly
         if quantity is None:
@@ -828,7 +831,7 @@ class BinanceExecutor:
         entry_side = "BUY" if signal.direction == "LONG" else "SELL"
 
         # Place entry order only (SL/TP managed by price monitoring)
-        entry_order = await self.place_market_order(entry_side, quantity)
+        entry_order = await self.place_market_order(entry_side, quantity, symbol)
 
         if not entry_order.is_filled and entry_order.status != OrderStatus.NEW:
             logger.error("Entry order failed", status=entry_order.status.value)
@@ -836,6 +839,7 @@ class BinanceExecutor:
 
         logger.info(
             "Signal executed (SL/TP via price monitoring)",
+            symbol=symbol,
             signal_type=signal.type,
             direction=signal.direction,
             quantity=quantity,

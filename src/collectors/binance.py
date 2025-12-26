@@ -22,6 +22,7 @@ class KlineData:
     """Candlestick data from Binance kline stream."""
 
     timestamp: datetime
+    symbol: str
     open: float
     high: float
     low: float
@@ -99,15 +100,28 @@ class BinanceWebSocketCollector:
 
     Features:
     - Multiple stream subscriptions (klines, orderbook, trades, liquidations)
+    - Multi-symbol support
     - Automatic reconnection with exponential backoff
     - Callback-based data delivery
     - Handles connection failures gracefully
     """
 
-    def __init__(self) -> None:
-        """Initialize the WebSocket collector."""
+    def __init__(self, symbols: Optional[list[str]] = None) -> None:
+        """Initialize the WebSocket collector.
+
+        Args:
+            symbols: List of symbols to track. If None, uses settings.trading_symbols
+        """
         self.settings = get_settings()
-        self.symbol = self.settings.trading_symbol.lower()
+        # Support multiple symbols
+        if symbols:
+            self.symbols = [s.upper() for s in symbols]
+        else:
+            self.symbols = self.settings.trading_symbols
+
+        # Legacy single symbol support
+        self.symbol = self.symbols[0].lower() if self.symbols else "btcusdt"
+
         self.ws = None
         self.is_connected = False
         self.is_running = False
@@ -126,17 +140,23 @@ class BinanceWebSocketCollector:
         self._trade_callbacks: list[Callable[[TradeData], None]] = []
         self._liquidation_callbacks: list[Callable[[LiquidationData], None]] = []
 
-        # Data storage (for polling access)
-        self._latest_klines: dict[str, KlineData] = {}  # keyed by interval
-        self._latest_orderbook: Optional[OrderbookData] = None
-        self._latest_trade: Optional[TradeData] = None
-        self._recent_trades: list[TradeData] = []  # Last 100 trades
-        self._recent_liquidations: list[LiquidationData] = []  # Last 50 liquidations
+        # Data storage per symbol (for polling access)
+        # Format: {symbol: {interval: KlineData}}
+        self._latest_klines: dict[str, dict[str, KlineData]] = {s: {} for s in self.symbols}
+        self._latest_trades: dict[str, TradeData] = {}  # {symbol: TradeData}
+        self._recent_trades: dict[str, list[TradeData]] = {s: [] for s in self.symbols}
+        self._recent_liquidations: list[LiquidationData] = []  # All symbols
+        self._latest_orderbook: Optional[OrderbookData] = None  # Legacy
         self._max_trades = 100
         self._max_liquidations = 50
 
         # Tasks
         self._receive_task = None
+
+        logger.debug(
+            "WebSocket collector initialized",
+            symbols=self.symbols,
+        )
 
     async def connect(self) -> None:
         """Establish WebSocket connection with auto-reconnect."""
@@ -154,14 +174,14 @@ class BinanceWebSocketCollector:
                 stream_path = "/".join(self.streams)
                 ws_url = f"{base_url}/stream?streams={stream_path}"
 
-                logger.info("Connecting to Binance WebSocket", url=ws_url)
+                logger.debug("Connecting to Binance WebSocket", url=ws_url)
 
                 self.ws = await websockets.connect(ws_url)
                 self.is_connected = True
                 self.reconnect_delay = 1
                 self.reconnect_attempts = 0
 
-                logger.info("WebSocket connected successfully")
+                logger.debug("WebSocket connected successfully")
 
                 # Start receiving messages
                 await self._handle_messages()
@@ -203,42 +223,63 @@ class BinanceWebSocketCollector:
 
         if self.ws and not self.ws.closed:
             await self.ws.close()
-            logger.info("WebSocket disconnected")
+            logger.debug("WebSocket disconnected")
 
         self.is_connected = False
 
-    async def subscribe_klines(self, intervals: list[str]) -> None:
-        """Subscribe to kline (candlestick) streams.
+    async def subscribe_klines(self, intervals: list[str], symbols: Optional[list[str]] = None) -> None:
+        """Subscribe to kline (candlestick) streams for all symbols.
 
         Args:
             intervals: List of kline intervals (e.g., ["1m", "15m"])
+            symbols: Optional list of symbols. If None, uses all configured symbols.
         """
-        for interval in intervals:
-            stream = f"{self.symbol}@kline_{interval}"
+        target_symbols = symbols or self.symbols
+        for symbol in target_symbols:
+            for interval in intervals:
+                stream = f"{symbol.lower()}@kline_{interval}"
+                if stream not in self.streams:
+                    self.streams.append(stream)
+                    logger.debug("Subscribed to kline stream", symbol=symbol, interval=interval)
+
+    async def subscribe_orderbook(self, symbols: Optional[list[str]] = None) -> None:
+        """Subscribe to orderbook depth stream (20 levels, 100ms updates).
+
+        Args:
+            symbols: Optional list of symbols. If None, uses first symbol only.
+        """
+        target_symbols = symbols or [self.symbols[0]] if self.symbols else []
+        for symbol in target_symbols:
+            stream = f"{symbol.lower()}@depth20@100ms"
             if stream not in self.streams:
                 self.streams.append(stream)
-                logger.info("Subscribed to kline stream", interval=interval)
+                logger.debug("Subscribed to orderbook stream", symbol=symbol)
 
-    async def subscribe_orderbook(self) -> None:
-        """Subscribe to orderbook depth stream (20 levels, 100ms updates)."""
-        stream = f"{self.symbol}@depth20@100ms"
-        if stream not in self.streams:
-            self.streams.append(stream)
-            logger.info("Subscribed to orderbook stream")
+    async def subscribe_trades(self, symbols: Optional[list[str]] = None) -> None:
+        """Subscribe to aggregated trade stream for all symbols.
 
-    async def subscribe_trades(self) -> None:
-        """Subscribe to aggregated trade stream."""
-        stream = f"{self.symbol}@aggTrade"
-        if stream not in self.streams:
-            self.streams.append(stream)
-            logger.info("Subscribed to trade stream")
+        Args:
+            symbols: Optional list of symbols. If None, uses all configured symbols.
+        """
+        target_symbols = symbols or self.symbols
+        for symbol in target_symbols:
+            stream = f"{symbol.lower()}@aggTrade"
+            if stream not in self.streams:
+                self.streams.append(stream)
+                logger.debug("Subscribed to trade stream", symbol=symbol)
 
-    async def subscribe_liquidations(self) -> None:
-        """Subscribe to liquidation order stream."""
-        stream = f"{self.symbol}@forceOrder"
-        if stream not in self.streams:
-            self.streams.append(stream)
-            logger.info("Subscribed to liquidation stream")
+    async def subscribe_liquidations(self, symbols: Optional[list[str]] = None) -> None:
+        """Subscribe to liquidation order stream.
+
+        Args:
+            symbols: Optional list of symbols. If None, uses all configured symbols.
+        """
+        target_symbols = symbols or self.symbols
+        for symbol in target_symbols:
+            stream = f"{symbol.lower()}@forceOrder"
+            if stream not in self.streams:
+                self.streams.append(stream)
+                logger.debug("Subscribed to liquidation stream", symbol=symbol)
 
     def on_kline(self, callback: Callable[[KlineData], None]) -> None:
         """Register a callback for kline data.
@@ -272,8 +313,12 @@ class BinanceWebSocketCollector:
         """
         self._liquidation_callbacks.append(callback)
 
-    async def get_latest_data(self, data_type: str) -> Optional[Any]:
-        """Get the latest cached data by type.
+    async def get_latest_data(
+        self,
+        data_type: str,
+        symbol: Optional[str] = None,
+    ) -> Optional[Any]:
+        """Get the latest cached data by type and symbol.
 
         Args:
             data_type: Type of data to retrieve:
@@ -282,16 +327,21 @@ class BinanceWebSocketCollector:
                 - "trades": List of recent trades
                 - "kline_1m", "kline_15m", etc.: Latest kline for interval
                 - "liquidations": List of recent liquidations
+            symbol: Symbol to get data for. If None, uses first symbol.
 
         Returns:
             Cached data or None if not available
         """
+        target_symbol = symbol.upper() if symbol else self.symbols[0]
+
         if data_type in ("ticker", "trade"):
-            if self._latest_trade:
+            trade = self._latest_trades.get(target_symbol)
+            if trade:
                 return {
-                    "price": self._latest_trade.price,
-                    "quantity": self._latest_trade.quantity,
-                    "timestamp": self._latest_trade.timestamp,
+                    "price": trade.price,
+                    "quantity": trade.quantity,
+                    "timestamp": trade.timestamp,
+                    "symbol": target_symbol,
                 }
             return None
 
@@ -305,11 +355,13 @@ class BinanceWebSocketCollector:
             return None
 
         elif data_type == "trades":
-            return self._recent_trades.copy() if self._recent_trades else None
+            trades = self._recent_trades.get(target_symbol)
+            return trades.copy() if trades else None
 
         elif data_type.startswith("kline_"):
             interval = data_type.replace("kline_", "")
-            kline = self._latest_klines.get(interval)
+            symbol_klines = self._latest_klines.get(target_symbol, {})
+            kline = symbol_klines.get(interval)
             if kline:
                 return {
                     "open": kline.open,
@@ -320,6 +372,7 @@ class BinanceWebSocketCollector:
                     "interval": kline.interval,
                     "is_closed": kline.is_closed,
                     "timestamp": kline.timestamp,
+                    "symbol": target_symbol,
                 }
             return None
 
@@ -386,8 +439,11 @@ class BinanceWebSocketCollector:
         """
         try:
             k = data["k"]
+            symbol = data["s"].upper()  # Extract symbol from message
+
             kline = KlineData(
                 timestamp=datetime.fromtimestamp(k["t"] / 1000),
+                symbol=symbol,
                 open=float(k["o"]),
                 high=float(k["h"]),
                 low=float(k["l"]),
@@ -397,8 +453,10 @@ class BinanceWebSocketCollector:
                 is_closed=k["x"],
             )
 
-            # Store latest kline by interval
-            self._latest_klines[kline.interval] = kline
+            # Store latest kline by symbol and interval
+            if symbol not in self._latest_klines:
+                self._latest_klines[symbol] = {}
+            self._latest_klines[symbol][kline.interval] = kline
 
             for callback in self._kline_callbacks:
                 try:
@@ -449,6 +507,8 @@ class BinanceWebSocketCollector:
             data: Trade data payload
         """
         try:
+            symbol = data["s"].upper()  # Extract symbol from message
+
             trade = TradeData(
                 timestamp=datetime.fromtimestamp(data["T"] / 1000),
                 price=float(data["p"]),
@@ -457,11 +517,14 @@ class BinanceWebSocketCollector:
                 trade_id=int(data["a"]),
             )
 
-            # Store latest trade and maintain recent trades list
-            self._latest_trade = trade
-            self._recent_trades.append(trade)
-            if len(self._recent_trades) > self._max_trades:
-                self._recent_trades = self._recent_trades[-self._max_trades:]
+            # Store latest trade per symbol and maintain recent trades list
+            self._latest_trades[symbol] = trade
+
+            if symbol not in self._recent_trades:
+                self._recent_trades[symbol] = []
+            self._recent_trades[symbol].append(trade)
+            if len(self._recent_trades[symbol]) > self._max_trades:
+                self._recent_trades[symbol] = self._recent_trades[symbol][-self._max_trades:]
 
             for callback in self._trade_callbacks:
                 try:
@@ -801,7 +864,7 @@ class BinanceRestCollector:
                     "is_closed": True,  # Historical klines are always closed
                 })
 
-            logger.info(
+            logger.debug(
                 "Fetched historical klines",
                 symbol=symbol,
                 interval=interval,
@@ -823,4 +886,4 @@ class BinanceRestCollector:
         """Close the aiohttp session."""
         if self.session and not self.session.closed:
             await self.session.close()
-            logger.info("REST API session closed")
+            logger.debug("REST API session closed")

@@ -98,10 +98,11 @@ class TestWickReversalSignal:
 
     @pytest.fixture
     def signal_generator(self) -> WickReversalSignal:
-        """Create signal generator with mocked settings."""
+        """Create signal generator with mocked settings and RSI disabled."""
         with patch("src.signals.scalp.get_settings") as mock_settings:
             mock_settings.return_value = MagicMock()
-            return WickReversalSignal()
+            # Disable RSI filter for basic tests
+            return WickReversalSignal(rsi_enabled=False)
 
     def test_name(self, signal_generator: WickReversalSignal) -> None:
         """Test signal generator name."""
@@ -432,22 +433,33 @@ class TestWickReversalSignal:
 
     def test_should_exit_on_volume(self, signal_generator: WickReversalSignal) -> None:
         """Test volume-based exit condition."""
+        from datetime import timedelta
+
         # No context - should return False
         assert signal_generator.should_exit_on_volume(300.0) is False
 
-        # Set context with volume threshold
+        # Set context with volume threshold (entry time 1 minute ago)
+        signal_generator._last_signal_context = WickSignalContext(
+            wick_low=50000.0,
+            wick_high=50100.0,
+            entry_time=datetime.now(timezone.utc) - timedelta(seconds=60),
+            volume_threshold=200.0,
+        )
+
+        # Volume above threshold (after min holding time)
+        assert signal_generator.should_exit_on_volume(300.0) is True
+
+        # Volume below threshold
+        assert signal_generator.should_exit_on_volume(150.0) is False
+
+        # Test min holding time - entry just now should not exit
         signal_generator._last_signal_context = WickSignalContext(
             wick_low=50000.0,
             wick_high=50100.0,
             entry_time=datetime.now(timezone.utc),
             volume_threshold=200.0,
         )
-
-        # Volume above threshold
-        assert signal_generator.should_exit_on_volume(300.0) is True
-
-        # Volume below threshold
-        assert signal_generator.should_exit_on_volume(150.0) is False
+        assert signal_generator.should_exit_on_volume(300.0) is False  # Too early
 
     def test_clear_buffers(self, signal_generator: WickReversalSignal) -> None:
         """Test clearing candle buffers."""
@@ -505,3 +517,235 @@ class TestWickSignalContext:
         assert context.wick_low == 49900.0
         assert context.wick_high == 50100.0
         assert context.volume_threshold == 200.0
+
+
+class TestRSIFilter:
+    """Tests for RSI filter in WickReversalSignal."""
+
+    @pytest.fixture
+    def signal_generator_rsi_enabled(self) -> WickReversalSignal:
+        """Create signal generator with RSI enabled."""
+        with patch("src.signals.scalp.get_settings") as mock_settings:
+            mock_settings.return_value = MagicMock()
+            return WickReversalSignal(
+                rsi_enabled=True,
+                rsi_oversold=40,
+                rsi_overbought=60,
+            )
+
+    @pytest.fixture
+    def signal_generator_rsi_disabled(self) -> WickReversalSignal:
+        """Create signal generator with RSI disabled."""
+        with patch("src.signals.scalp.get_settings") as mock_settings:
+            mock_settings.return_value = MagicMock()
+            return WickReversalSignal(rsi_enabled=False)
+
+    def test_rsi_calculation(self, signal_generator_rsi_enabled: WickReversalSignal) -> None:
+        """Test RSI calculation."""
+        # Create candles with consistent upward movement (should have high RSI)
+        base_price = 50000.0
+        for i in range(25):
+            candle = CandleData(
+                timestamp=datetime.now(timezone.utc) - timedelta(minutes=25 - i),
+                open=base_price + i * 100,
+                high=base_price + i * 100 + 50,
+                low=base_price + i * 100 - 20,
+                close=base_price + i * 100 + 30,  # Consistently up
+                volume=100.0,
+                interval="1m",
+            )
+            signal_generator_rsi_enabled.add_candle(candle)
+
+        candles = list(signal_generator_rsi_enabled._candles_1m)
+        rsi = signal_generator_rsi_enabled._calculate_rsi(candles, 14)
+
+        assert rsi is not None
+        assert 60 < rsi <= 100  # Should be high RSI (overbought territory)
+
+    def test_rsi_calculation_downtrend(self, signal_generator_rsi_enabled: WickReversalSignal) -> None:
+        """Test RSI calculation in downtrend."""
+        # Create candles with consistent downward movement (should have low RSI)
+        base_price = 50000.0
+        for i in range(25):
+            candle = CandleData(
+                timestamp=datetime.now(timezone.utc) - timedelta(minutes=25 - i),
+                open=base_price - i * 100,
+                high=base_price - i * 100 + 20,
+                low=base_price - i * 100 - 50,
+                close=base_price - i * 100 - 30,  # Consistently down
+                volume=100.0,
+                interval="1m",
+            )
+            signal_generator_rsi_enabled.add_candle(candle)
+
+        candles = list(signal_generator_rsi_enabled._candles_1m)
+        rsi = signal_generator_rsi_enabled._calculate_rsi(candles, 14)
+
+        assert rsi is not None
+        assert 0 <= rsi < 40  # Should be low RSI (oversold territory)
+
+    def test_rsi_filter_long_passes(self, signal_generator_rsi_enabled: WickReversalSignal) -> None:
+        """Test RSI filter allows LONG when RSI < 40."""
+        # Create downtrend candles (low RSI)
+        base_price = 50000.0
+        for i in range(25):
+            candle = CandleData(
+                timestamp=datetime.now(timezone.utc) - timedelta(minutes=25 - i),
+                open=base_price - i * 100,
+                high=base_price - i * 100 + 20,
+                low=base_price - i * 100 - 50,
+                close=base_price - i * 100 - 30,
+                volume=100.0,
+                interval="1m",
+            )
+            signal_generator_rsi_enabled.add_candle(candle)
+
+        candles = list(signal_generator_rsi_enabled._candles_1m)
+        passes, rsi = signal_generator_rsi_enabled._check_rsi_filter(candles, "LONG")
+
+        assert passes is True
+        assert rsi < 40
+
+    def test_rsi_filter_long_blocked(self, signal_generator_rsi_enabled: WickReversalSignal) -> None:
+        """Test RSI filter blocks LONG when RSI > 40."""
+        # Create uptrend candles (high RSI)
+        base_price = 50000.0
+        for i in range(25):
+            candle = CandleData(
+                timestamp=datetime.now(timezone.utc) - timedelta(minutes=25 - i),
+                open=base_price + i * 100,
+                high=base_price + i * 100 + 50,
+                low=base_price + i * 100 - 20,
+                close=base_price + i * 100 + 30,
+                volume=100.0,
+                interval="1m",
+            )
+            signal_generator_rsi_enabled.add_candle(candle)
+
+        candles = list(signal_generator_rsi_enabled._candles_1m)
+        passes, rsi = signal_generator_rsi_enabled._check_rsi_filter(candles, "LONG")
+
+        assert passes is False
+        assert rsi > 40
+
+    def test_rsi_filter_short_passes(self, signal_generator_rsi_enabled: WickReversalSignal) -> None:
+        """Test RSI filter allows SHORT when RSI > 60."""
+        # Create uptrend candles (high RSI)
+        base_price = 50000.0
+        for i in range(25):
+            candle = CandleData(
+                timestamp=datetime.now(timezone.utc) - timedelta(minutes=25 - i),
+                open=base_price + i * 100,
+                high=base_price + i * 100 + 50,
+                low=base_price + i * 100 - 20,
+                close=base_price + i * 100 + 30,
+                volume=100.0,
+                interval="1m",
+            )
+            signal_generator_rsi_enabled.add_candle(candle)
+
+        candles = list(signal_generator_rsi_enabled._candles_1m)
+        passes, rsi = signal_generator_rsi_enabled._check_rsi_filter(candles, "SHORT")
+
+        assert passes is True
+        assert rsi > 60
+
+    def test_rsi_filter_short_blocked(self, signal_generator_rsi_enabled: WickReversalSignal) -> None:
+        """Test RSI filter blocks SHORT when RSI < 60."""
+        # Create downtrend candles (low RSI)
+        base_price = 50000.0
+        for i in range(25):
+            candle = CandleData(
+                timestamp=datetime.now(timezone.utc) - timedelta(minutes=25 - i),
+                open=base_price - i * 100,
+                high=base_price - i * 100 + 20,
+                low=base_price - i * 100 - 50,
+                close=base_price - i * 100 - 30,
+                volume=100.0,
+                interval="1m",
+            )
+            signal_generator_rsi_enabled.add_candle(candle)
+
+        candles = list(signal_generator_rsi_enabled._candles_1m)
+        passes, rsi = signal_generator_rsi_enabled._check_rsi_filter(candles, "SHORT")
+
+        assert passes is False
+        assert rsi < 60
+
+    def test_rsi_filter_disabled(self, signal_generator_rsi_disabled: WickReversalSignal) -> None:
+        """Test RSI filter passes when disabled."""
+        # No candles needed - should pass regardless
+        candles: list[CandleData] = []
+        passes, rsi = signal_generator_rsi_disabled._check_rsi_filter(candles, "LONG")
+
+        assert passes is True
+        assert rsi == 50.0  # Neutral when disabled
+
+    def test_rsi_insufficient_data(self, signal_generator_rsi_enabled: WickReversalSignal) -> None:
+        """Test RSI filter with insufficient data."""
+        # Only 10 candles (need 15 for RSI 14)
+        for i in range(10):
+            candle = CandleData(
+                timestamp=datetime.now(timezone.utc) - timedelta(minutes=10 - i),
+                open=50000.0 + i * 10,
+                high=50050.0 + i * 10,
+                low=49950.0 + i * 10,
+                close=50020.0 + i * 10,
+                volume=100.0,
+                interval="1m",
+            )
+            signal_generator_rsi_enabled.add_candle(candle)
+
+        candles = list(signal_generator_rsi_enabled._candles_1m)
+        passes, rsi = signal_generator_rsi_enabled._check_rsi_filter(candles, "LONG")
+
+        assert passes is False
+        assert rsi == 0.0
+
+    @pytest.mark.asyncio
+    async def test_generate_long_blocked_by_rsi(self, signal_generator_rsi_enabled: WickReversalSignal) -> None:
+        """Test LONG signal blocked by high RSI."""
+        # Create 25 15m candles showing uptrend
+        base_price = 50000.0
+        for i in range(25):
+            candle = CandleData(
+                timestamp=datetime.now(timezone.utc) - timedelta(minutes=15 * (25 - i)),
+                open=base_price + i * 50,
+                high=base_price + i * 50 + 100,
+                low=base_price + i * 50 - 50,
+                close=base_price + i * 50 + 80,
+                volume=100.0,
+                interval="15m",
+            )
+            signal_generator_rsi_enabled.add_candle(candle)
+
+        # Create 1m candles showing strong uptrend (HIGH RSI)
+        for i in range(25):
+            candle = CandleData(
+                timestamp=datetime.now(timezone.utc) - timedelta(minutes=26 - i),
+                open=51200.0 + i * 50,
+                high=51300.0 + i * 50,
+                low=51180.0 + i * 50,
+                close=51280.0 + i * 50,  # Strong uptrend
+                volume=100.0,
+                interval="1m",
+            )
+            signal_generator_rsi_enabled.add_candle(candle)
+
+        # Add high volume candle with lower wick (bullish hammer)
+        hammer_candle = CandleData(
+            timestamp=datetime.now(timezone.utc),
+            open=52670.0,
+            high=52700.0,
+            low=52500.0,  # Long lower wick
+            close=52680.0,
+            volume=400.0,  # 4x normal volume
+            interval="1m",
+        )
+        signal_generator_rsi_enabled.add_candle(hammer_candle)
+
+        market_state = {"price": 52680.0}
+        signal = await signal_generator_rsi_enabled.generate(market_state)
+
+        # Should be blocked by RSI (RSI is high due to strong uptrend)
+        assert signal is None
