@@ -72,131 +72,202 @@ async def download_data(
 def generate_scalp_signals(df: pd.DataFrame) -> list[Signal]:
     """Generate scalp signals from historical data.
 
-    Simulates signal generation based on historical conditions:
-    1. LiquidationCascade: Large volume spikes with price reversal
-    2. FundingRate: Simulated from price volatility patterns
-    3. VolumeBreakout: Volume > 3x average with price breakout
+    Phase 3 강화 버전:
+    - 거래량 기준: 3x (완화)
+    - RSI 필터: 38/62 (완화)
+    - MACD OR 조건 (완화)
+    - 볼린저 밴드 시그널 추가
+    - 신뢰도 기준 60%로 하향
     """
     signals = []
 
     # Calculate indicators
     df = df.copy()
-    df['volume_ma'] = df['volume'].rolling(window=60).mean()
+    df['volume_ma'] = df['volume'].rolling(window=20).mean()
     df['volume_ratio'] = df['volume'] / df['volume_ma']
     df['price_change'] = df['close'].pct_change()
     df['price_ma'] = df['close'].rolling(window=20).mean()
-    df['volatility'] = df['price_change'].rolling(window=60).std()
+    df['volatility'] = df['price_change'].rolling(window=20).std()
+
+    # RSI calculation
+    delta = df['close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+    rs = gain / loss
+    df['rsi'] = 100 - (100 / (1 + rs))
+
+    # MACD calculation
+    ema_fast = df['close'].ewm(span=12, adjust=False).mean()
+    ema_slow = df['close'].ewm(span=26, adjust=False).mean()
+    df['macd'] = ema_fast - ema_slow
+    df['macd_signal'] = df['macd'].ewm(span=9, adjust=False).mean()
+    df['macd_histogram'] = df['macd'] - df['macd_signal']
+
+    # Phase 3: 볼린저 밴드 계산
+    df['bb_mid'] = df['close'].rolling(window=20).mean()
+    df['bb_std'] = df['close'].rolling(window=20).std()
+    df['bb_upper'] = df['bb_mid'] + (df['bb_std'] * 2)
+    df['bb_lower'] = df['bb_mid'] - (df['bb_std'] * 2)
+    df['bb_pct'] = (df['close'] - df['bb_lower']) / (df['bb_upper'] - df['bb_lower'])
+
+    # Phase 3: 캔들 패턴 계산
+    df['body'] = abs(df['close'] - df['open'])
+    df['upper_wick'] = df['high'] - df[['open', 'close']].max(axis=1)
+    df['lower_wick'] = df[['open', 'close']].min(axis=1) - df['low']
+    df['full_range'] = df['high'] - df['low']
+    df['wick_ratio_up'] = df['upper_wick'] / df['full_range'].replace(0, np.nan)
+    df['wick_ratio_down'] = df['lower_wick'] / df['full_range'].replace(0, np.nan)
+
+    # Phase 3 완화된 기준
+    VOLUME_THRESHOLD = 3.0  # 5.0 → 3.0
+    RSI_OVERSOLD = 38  # 35 → 38
+    RSI_OVERBOUGHT = 62  # 65 → 62
+    MIN_CONFIDENCE = 0.60  # 0.65 → 0.60
 
     # Skip first 100 rows for indicator warmup
     for i in range(100, len(df)):
         row = df.iloc[i]
         timestamp = row['timestamp']
         price = row['close']
+        rsi = row['rsi'] if not pd.isna(row['rsi']) else 50
+        macd = row['macd'] if not pd.isna(row['macd']) else 0
+        macd_signal = row['macd_signal'] if not pd.isna(row['macd_signal']) else 0
+        macd_histogram = row['macd_histogram'] if not pd.isna(row['macd_histogram']) else 0
+        bb_pct = row['bb_pct'] if not pd.isna(row['bb_pct']) else 0.5
+        wick_up = row['wick_ratio_up'] if not pd.isna(row['wick_ratio_up']) else 0
+        wick_down = row['wick_ratio_down'] if not pd.isna(row['wick_ratio_down']) else 0
 
         # Skip if indicators are NaN
         if pd.isna(row['volume_ratio']) or pd.isna(row['volatility']):
             continue
 
-        # 1. Volume Breakout Signal
-        if row['volume_ratio'] > 3.0:
-            # Determine direction based on price movement
-            if row['close'] > row['open']:
-                direction = "LONG"
-                stop_loss = price * 0.985
-                take_profit = price * 1.03
+        # Phase 3: MACD 완화된 체크 (OR 조건)
+        def check_macd_relaxed(direction):
+            if direction == "LONG":
+                # MACD > Signal OR 히스토그램 상승 중 OR 히스토그램 > 0
+                return macd > macd_signal or macd_histogram > 0
             else:
-                direction = "SHORT"
-                stop_loss = price * 1.015
-                take_profit = price * 0.97
+                return macd < macd_signal or macd_histogram < 0
 
-            confidence = min(0.8, row['volume_ratio'] / 6.0)
-
-            signal = Signal(
-                type="SCALP",
-                direction=direction,
-                confidence=confidence,
-                entry_price=price,
-                stop_loss=stop_loss,
-                take_profit=take_profit,
-                reason=f"Volume breakout: {row['volume_ratio']:.1f}x average",
-                timestamp=timestamp,
-            )
-            signals.append(signal)
-
-        # 2. Simulated Liquidation Cascade (large price move + high volume)
-        if abs(row['price_change']) > 0.01 and row['volume_ratio'] > 2.0:
-            # Counter-trend entry after cascade
-            if row['price_change'] < -0.01:
+        # 1. Volume Breakout Signal (Phase 3: 완화된 조건)
+        if row['volume_ratio'] >= VOLUME_THRESHOLD:
+            if row['close'] > row['open'] and rsi < RSI_OVERSOLD:
                 direction = "LONG"
                 stop_loss = price * 0.985
                 take_profit = price * 1.03
+            elif row['close'] < row['open'] and rsi > RSI_OVERBOUGHT:
+                direction = "SHORT"
+                stop_loss = price * 1.015
+                take_profit = price * 0.97
             else:
-                direction = "SHORT"
-                stop_loss = price * 1.015
-                take_profit = price * 0.97
+                direction = None
 
-            confidence = min(0.85, abs(row['price_change']) * 50)
+            if direction and check_macd_relaxed(direction):
+                base_conf = 0.55
+                volume_bonus = min(0.15, (row['volume_ratio'] - 3) / 20)
+                rsi_bonus = 0.1 if (rsi < 32 or rsi > 68) else 0.05
+                macd_bonus = min(abs(macd_histogram) * 40, 0.1)
+                confidence = min(0.9, base_conf + volume_bonus + rsi_bonus + macd_bonus)
 
-            signal = Signal(
-                type="SCALP",
-                direction=direction,
-                confidence=confidence,
-                entry_price=price,
-                stop_loss=stop_loss,
-                take_profit=take_profit,
-                reason=f"Liquidation cascade: {row['price_change']*100:.2f}% move",
-                timestamp=timestamp,
-            )
-            signals.append(signal)
+                if confidence >= MIN_CONFIDENCE:
+                    signals.append(Signal(
+                        type="SCALP", direction=direction, confidence=confidence,
+                        entry_price=price, stop_loss=stop_loss, take_profit=take_profit,
+                        reason=f"Volume {row['volume_ratio']:.1f}x + RSI {rsi:.0f}",
+                        timestamp=timestamp,
+                    ))
 
-        # 3. Simulated Funding Rate Extreme (extended trend)
-        # Check for extreme volatility as proxy
-        if row['volatility'] > 0.005:
-            # Look for trend reversal
-            recent_prices = df.iloc[i-10:i]['close']
-            trend = (recent_prices.iloc[-1] - recent_prices.iloc[0]) / recent_prices.iloc[0]
+        # 2. Phase 3: 볼린저 밴드 반전 시그널
+        if row['volume_ratio'] >= 2.0:
+            # 하단 밴드 터치 + 양봉 = LONG
+            if bb_pct < 0.05 and row['close'] > row['open'] and rsi < 45:
+                if check_macd_relaxed("LONG"):
+                    confidence = 0.6 + min((0.05 - bb_pct) * 4, 0.15) + min((45 - rsi) / 100, 0.1)
+                    if confidence >= MIN_CONFIDENCE:
+                        signals.append(Signal(
+                            type="SCALP", direction="LONG", confidence=min(0.85, confidence),
+                            entry_price=price, stop_loss=row['bb_lower'] * 0.998,
+                            take_profit=row['bb_mid'],
+                            reason=f"BB lower touch + RSI {rsi:.0f}",
+                            timestamp=timestamp,
+                        ))
 
-            if trend > 0.02:  # Extended uptrend -> SHORT
-                direction = "SHORT"
-                stop_loss = price * 1.015
-                take_profit = price * 0.97
+            # 상단 밴드 터치 + 음봉 = SHORT
+            if bb_pct > 0.95 and row['close'] < row['open'] and rsi > 55:
+                if check_macd_relaxed("SHORT"):
+                    confidence = 0.6 + min((bb_pct - 0.95) * 4, 0.15) + min((rsi - 55) / 100, 0.1)
+                    if confidence >= MIN_CONFIDENCE:
+                        signals.append(Signal(
+                            type="SCALP", direction="SHORT", confidence=min(0.85, confidence),
+                            entry_price=price, stop_loss=row['bb_upper'] * 1.002,
+                            take_profit=row['bb_mid'],
+                            reason=f"BB upper touch + RSI {rsi:.0f}",
+                            timestamp=timestamp,
+                        ))
 
-                signal = Signal(
-                    type="SCALP",
-                    direction=direction,
-                    confidence=min(0.75, abs(trend) * 20),
-                    entry_price=price,
-                    stop_loss=stop_loss,
-                    take_profit=take_profit,
-                    reason=f"Funding rate extreme: {trend*100:.2f}% extended trend",
-                    timestamp=timestamp,
-                )
-                signals.append(signal)
-            elif trend < -0.02:  # Extended downtrend -> LONG
+        # 3. Phase 3: 윅 반전 패턴 (완화된 조건)
+        if row['volume_ratio'] >= 1.5:
+            # 긴 하위꼬리 + 양봉 = LONG
+            if wick_down > 0.6 and row['close'] > row['open'] and rsi < 45:
+                if check_macd_relaxed("LONG"):
+                    confidence = 0.55 + min(wick_down * 0.25, 0.2) + min((45 - rsi) / 100, 0.1)
+                    if confidence >= MIN_CONFIDENCE:
+                        signals.append(Signal(
+                            type="SCALP", direction="LONG", confidence=min(0.85, confidence),
+                            entry_price=price, stop_loss=row['low'] * 0.998,
+                            take_profit=price * 1.025,
+                            reason=f"Wick reversal {wick_down*100:.0f}% + RSI {rsi:.0f}",
+                            timestamp=timestamp,
+                        ))
+
+            # 긴 상위꼬리 + 음봉 = SHORT
+            if wick_up > 0.6 and row['close'] < row['open'] and rsi > 55:
+                if check_macd_relaxed("SHORT"):
+                    confidence = 0.55 + min(wick_up * 0.25, 0.2) + min((rsi - 55) / 100, 0.1)
+                    if confidence >= MIN_CONFIDENCE:
+                        signals.append(Signal(
+                            type="SCALP", direction="SHORT", confidence=min(0.85, confidence),
+                            entry_price=price, stop_loss=row['high'] * 1.002,
+                            take_profit=price * 0.975,
+                            reason=f"Wick reversal {wick_up*100:.0f}% + RSI {rsi:.0f}",
+                            timestamp=timestamp,
+                        ))
+
+        # 4. Liquidation Cascade (완화된 조건)
+        if abs(row['price_change']) > 0.012 and row['volume_ratio'] >= 3.0:
+            if row['price_change'] < -0.012 and rsi < RSI_OVERSOLD + 5:
                 direction = "LONG"
                 stop_loss = price * 0.985
                 take_profit = price * 1.03
+            elif row['price_change'] > 0.012 and rsi > RSI_OVERBOUGHT - 5:
+                direction = "SHORT"
+                stop_loss = price * 1.015
+                take_profit = price * 0.97
+            else:
+                direction = None
 
-                signal = Signal(
-                    type="SCALP",
-                    direction=direction,
-                    confidence=min(0.75, abs(trend) * 20),
-                    entry_price=price,
-                    stop_loss=stop_loss,
-                    take_profit=take_profit,
-                    reason=f"Funding rate extreme: {trend*100:.2f}% extended trend",
-                    timestamp=timestamp,
-                )
-                signals.append(signal)
+            if direction and check_macd_relaxed(direction):
+                confidence = min(0.85, 0.6 + abs(row['price_change']) * 10)
+                if confidence >= MIN_CONFIDENCE:
+                    signals.append(Signal(
+                        type="SCALP", direction=direction, confidence=confidence,
+                        entry_price=price, stop_loss=stop_loss, take_profit=take_profit,
+                        reason=f"Cascade {row['price_change']*100:.1f}%",
+                        timestamp=timestamp,
+                    ))
 
-    logger.info(f"Generated {len(signals)} scalp signals")
+    logger.info(f"Generated {len(signals)} scalp signals (Phase 3 + BB)")
     return signals
 
 
 def generate_swing_signals(df: pd.DataFrame) -> list[Signal]:
     """Generate swing signals from historical data.
 
-    Uses EMA crossover and RSI for swing trading signals.
+    Phase 3 강화 버전:
+    - EMA 갭 기반 신뢰도 계산
+    - RSI 범위 확장 (35-65)
+    - MACD OR 조건 (완화)
+    - 신뢰도 기준 60%로 하향
     """
     signals = []
 
@@ -221,6 +292,15 @@ def generate_swing_signals(df: pd.DataFrame) -> list[Signal]:
     rs = gain / loss
     df_4h['rsi'] = 100 - (100 / (1 + rs))
 
+    # Phase 2: MACD calculation
+    ema_fast = df_4h['close'].ewm(span=12, adjust=False).mean()
+    ema_slow = df_4h['close'].ewm(span=26, adjust=False).mean()
+    df_4h['macd'] = ema_fast - ema_slow
+    df_4h['macd_signal'] = df_4h['macd'].ewm(span=9, adjust=False).mean()
+    df_4h['macd_histogram'] = df_4h['macd'] - df_4h['macd_signal']
+
+    MIN_CONFIDENCE = 0.60  # Phase 3: 최소 신뢰도 하향
+
     # Skip first 100 rows for indicator warmup
     for i in range(100, len(df_4h)):
         row = df_4h.iloc[i]
@@ -236,8 +316,8 @@ def generate_swing_signals(df: pd.DataFrame) -> list[Signal]:
         bullish_alignment = row['ema7'] > row['ema25'] > row['ema99']
         bearish_alignment = row['ema7'] < row['ema25'] < row['ema99']
 
-        # Check RSI in neutral zone (40-60)
-        rsi_neutral = 40 <= row['rsi'] <= 60
+        # Phase 3: Check RSI in expanded zone (35-65)
+        rsi_neutral = 35 <= row['rsi'] <= 65
 
         # Detect crossover
         prev_bullish = prev_row['ema7'] > prev_row['ema25'] if not pd.isna(prev_row['ema25']) else False
@@ -246,33 +326,103 @@ def generate_swing_signals(df: pd.DataFrame) -> list[Signal]:
         bullish_cross = bullish_alignment and not prev_bullish
         bearish_cross = bearish_alignment and not prev_bearish
 
+        # Phase 1: 강화된 신뢰도 계산
+        def calculate_swing_confidence(ema7, ema25, ema99, rsi):
+            """EMA 갭 기반 신뢰도 계산"""
+            confidence = 0.55  # Phase 1: 낮춘 base
+
+            # EMA 갭 보너스
+            ema_7_25_gap = abs(ema7 - ema25) / ema25
+            ema_25_99_gap = abs(ema25 - ema99) / ema99
+
+            if ema_7_25_gap > 0.05:
+                confidence += 0.15
+            elif ema_7_25_gap > 0.03:
+                confidence += 0.10
+            elif ema_7_25_gap > 0.02:
+                confidence += 0.05
+
+            if ema_25_99_gap > 0.05:
+                confidence += 0.15
+            elif ema_25_99_gap > 0.03:
+                confidence += 0.10
+            elif ema_25_99_gap > 0.02:
+                confidence += 0.05
+
+            # RSI 중립 보너스
+            rsi_dist = abs(rsi - 50)
+            if rsi_dist < 3:
+                confidence += 0.05
+            elif rsi_dist < 5:
+                confidence += 0.03
+
+            return min(0.95, confidence)
+
+        # Phase 2: MACD 값 추출
+        macd = row['macd'] if not pd.isna(row['macd']) else 0
+        macd_signal_val = row['macd_signal'] if not pd.isna(row['macd_signal']) else 0
+        macd_histogram = row['macd_histogram'] if not pd.isna(row['macd_histogram']) else 0
+
+        # Phase 2: MACD 모멘텀 확인 함수
+        def check_swing_macd(direction):
+            if direction == "LONG":
+                return macd > macd_signal_val  # MACD가 시그널 위에 있어야 함
+            else:
+                return macd < macd_signal_val  # MACD가 시그널 아래 있어야 함
+
         if bullish_cross and rsi_neutral:
-            signal = Signal(
-                type="SWING",
-                direction="LONG",
-                confidence=0.75,
-                entry_price=price,
-                stop_loss=price * 0.95,  # 5% SL
-                take_profit=price * 1.15,  # 15% TP
-                reason=f"EMA bullish alignment + RSI {row['rsi']:.1f}",
-                timestamp=timestamp,
+            # Phase 2: MACD 필터
+            if not check_swing_macd("LONG"):
+                continue
+
+            confidence = calculate_swing_confidence(
+                row['ema7'], row['ema25'], row['ema99'], row['rsi']
             )
-            signals.append(signal)
+
+            # Phase 2: MACD 보너스
+            macd_bonus = min(abs(macd_histogram) / 100, 0.05)
+            confidence = min(0.95, confidence + macd_bonus)
+
+            if confidence >= MIN_CONFIDENCE:
+                signal = Signal(
+                    type="SWING",
+                    direction="LONG",
+                    confidence=confidence,
+                    entry_price=price,
+                    stop_loss=price * 0.95,  # 5% SL
+                    take_profit=price * 1.15,  # 15% TP
+                    reason=f"EMA bullish + RSI {row['rsi']:.1f} + MACD confirmed",
+                    timestamp=timestamp,
+                )
+                signals.append(signal)
 
         elif bearish_cross and rsi_neutral:
-            signal = Signal(
-                type="SWING",
-                direction="SHORT",
-                confidence=0.75,
-                entry_price=price,
-                stop_loss=price * 1.05,  # 5% SL
-                take_profit=price * 0.85,  # 15% TP
-                reason=f"EMA bearish alignment + RSI {row['rsi']:.1f}",
-                timestamp=timestamp,
-            )
-            signals.append(signal)
+            # Phase 2: MACD 필터
+            if not check_swing_macd("SHORT"):
+                continue
 
-    logger.info(f"Generated {len(signals)} swing signals")
+            confidence = calculate_swing_confidence(
+                row['ema7'], row['ema25'], row['ema99'], row['rsi']
+            )
+
+            # Phase 2: MACD 보너스
+            macd_bonus = min(abs(macd_histogram) / 100, 0.05)
+            confidence = min(0.95, confidence + macd_bonus)
+
+            if confidence >= MIN_CONFIDENCE:
+                signal = Signal(
+                    type="SWING",
+                    direction="SHORT",
+                    confidence=confidence,
+                    entry_price=price,
+                    stop_loss=price * 1.05,  # 5% SL
+                    take_profit=price * 0.85,  # 15% TP
+                    reason=f"EMA bearish + RSI {row['rsi']:.1f} + MACD confirmed",
+                    timestamp=timestamp,
+                )
+                signals.append(signal)
+
+    logger.info(f"Generated {len(signals)} swing signals (Phase 3)")
     return signals
 
 
@@ -392,13 +542,20 @@ async def main():
     print(f"   [OK] Scalp signals: {len(scalp_signals):,}")
     print(f"   [OK] Swing signals: {len(swing_signals):,}")
 
-    # Step 3: Run scalp backtest
-    print("\n[Step 3] Running SCALP strategy backtest...")
+    # Step 3: Run scalp backtest (Phase 3: 공격적 포지션 사이징)
+    print("\n[Step 3] Running SCALP strategy backtest (Phase 3)...")
     scalp_engine = BacktestEngine(
         initial_capital=10000.0,
         commission=0.0004,
         slippage=0.0001,
-        fixed_position_value=1000.0,  # Fixed $1000 per trade
+        risk_per_trade=0.03,  # Phase 3: 거래당 3% 리스크
+        max_position_pct=0.15,  # Phase 3: 최대 15% 포지션
+        min_confidence=0.60,  # Phase 3: 최소 신뢰도 60%
+        # 부분익절 설정
+        partial_tp_enabled=True,
+        partial_tp_ratio=0.5,
+        partial_tp_rr=2.0,
+        move_sl_to_be=True,
     )
     scalp_result = scalp_engine.run(df, scalp_signals)
 
@@ -407,18 +564,24 @@ async def main():
 
     print_detailed_report(
         scalp_result,
-        "SCALP STRATEGY",
+        "SCALP STRATEGY (Phase 3: BB + Aggressive Sizing)",
         scalp_monthly,
         scalp_max_losses,
     )
 
-    # Step 4: Run swing backtest
-    print("\n[Step 4] Running SWING strategy backtest...")
+    # Step 4: Run swing backtest (Phase 3: 공격적 포지션 사이징)
+    print("\n[Step 4] Running SWING strategy backtest (Phase 3)...")
     swing_engine = BacktestEngine(
         initial_capital=10000.0,
         commission=0.0004,
         slippage=0.0001,
-        fixed_position_value=2000.0,  # Fixed $2000 per trade (larger for swing)
+        risk_per_trade=0.05,  # Phase 3: 스윙은 거래당 5% 리스크
+        max_position_pct=0.20,  # Phase 3: 최대 20% 포지션
+        min_confidence=0.60,  # Phase 3: 최소 신뢰도 60%
+        partial_tp_enabled=True,
+        partial_tp_ratio=0.5,
+        partial_tp_rr=2.0,
+        move_sl_to_be=True,
     )
     swing_result = swing_engine.run(df, swing_signals)
 
@@ -427,7 +590,7 @@ async def main():
 
     print_detailed_report(
         swing_result,
-        "SWING STRATEGY",
+        "SWING STRATEGY (Phase 3: Aggressive Sizing)",
         swing_monthly,
         swing_max_losses,
     )

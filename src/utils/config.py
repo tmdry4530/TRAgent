@@ -51,12 +51,24 @@ class Settings(BaseSettings):
     max_holding_minutes: int = 5  # 최대 홀딩 시간 (분)
     max_position_usd: float = 50.0  # 고정 포지션 크기 (USD) - 0이면 비율 사용
 
-    # Wick Reversal specific settings
+    # Wick Reversal specific settings - Phase 1 강화
     wick_ema_period: int = 20  # 15분봉 EMA 기간
-    wick_volume_multiplier: float = 3.0  # 진입용 거래량 배수
-    wick_ratio_threshold: float = 0.6  # 꼬리 비율 임계값 (60%)
+    wick_volume_multiplier: float = 5.0  # 진입용 거래량 배수 (3.0→5.0)
+    wick_ratio_threshold: float = 0.75  # 꼬리 비율 임계값 (0.6→0.75)
     wick_stop_loss_buffer: float = 0.001  # 0.1% 손절 버퍼
     wick_exit_volume_multiplier: float = 2.0  # 익절용 거래량 배수
+    wick_rsi_oversold: float = 35  # RSI 과매도 기준 (40→35)
+    wick_rsi_overbought: float = 65  # RSI 과매수 기준 (60→65)
+
+    # Swing signal settings
+    rsi_entry_min: float = 40  # RSI 진입 최소값
+    rsi_entry_max: float = 60  # RSI 진입 최대값
+
+    # Phase 4: 50x 레버리지 최적화 설정
+    # 백테스트 결과: 50% 승률, 178% 수익률, 33% MDD (10% 리스크 기준)
+    risk_per_trade: float = 0.10  # 거래당 리스크 10% (레버리지 50x 최적화)
+    max_position_pct: float = 0.90  # 최대 포지션 90% (레버리지 거래 허용)
+    min_signal_confidence: float = 0.60  # 최소 신뢰도 60%
 
     # Risk limits
     max_total_exposure_pct: float = 0.30  # 30% of account (단일 포지션)

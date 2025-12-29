@@ -17,17 +17,24 @@ logger = get_logger(__name__)
 
 
 class EmaRsiSwingSignal(BaseSignalGenerator):
-    """Signal generator for EMA+RSI swing trading strategy.
+    """Signal generator for EMA+RSI+MACD swing trading strategy.
 
-    Generates swing signals based on EMA alignment and RSI positioning.
-    LONG: EMA 7 > 25 > 99 (bullish alignment) + RSI 40-60 (neutral zone)
-    SHORT: EMA 7 < 25 < 99 (bearish alignment) + RSI 40-60 (neutral zone)
+    Phase 2 강화:
+    - EMA alignment (7 > 25 > 99 for bullish, reverse for bearish)
+    - RSI in neutral zone (40-60)
+    - MACD momentum confirmation
 
-    This strategy captures medium-term trends with confirmation.
+    This strategy captures medium-term trends with multiple confirmations.
     """
 
+    # Phase 2: MACD 설정
+    MACD_FAST = 12
+    MACD_SLOW = 26
+    MACD_SIGNAL = 9
+    MACD_ENABLED = True
+
     def __init__(self) -> None:
-        """Initialize EMA+RSI swing signal generator."""
+        """Initialize EMA+RSI+MACD swing signal generator."""
         self.settings = get_settings()
         self.ema_periods = [7, 25, 99]
         self.rsi_period = 14
@@ -43,7 +50,7 @@ class EmaRsiSwingSignal(BaseSignalGenerator):
         return ["ohlcv_4h", "price"]
 
     def _calculate_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Calculate EMA and RSI indicators.
+        """Calculate EMA, RSI, and MACD indicators.
 
         Args:
             df: OHLCV dataframe with 'close' column
@@ -58,7 +65,52 @@ class EmaRsiSwingSignal(BaseSignalGenerator):
         # Calculate RSI
         df["rsi"] = ta.rsi(df["close"], length=self.rsi_period)
 
+        # Phase 2: Calculate MACD
+        if self.MACD_ENABLED:
+            macd_result = ta.macd(
+                df["close"],
+                fast=self.MACD_FAST,
+                slow=self.MACD_SLOW,
+                signal=self.MACD_SIGNAL,
+            )
+            if macd_result is not None:
+                df["macd"] = macd_result.iloc[:, 0]  # MACD line
+                df["macd_signal"] = macd_result.iloc[:, 1]  # Signal line
+                df["macd_histogram"] = macd_result.iloc[:, 2]  # Histogram
+
         return df
+
+    def _check_macd_momentum(
+        self, macd: float, signal: float, histogram: float, direction: str
+    ) -> tuple[bool, float]:
+        """Check if MACD confirms the trade direction.
+
+        For LONG: MACD > Signal (bullish momentum)
+        For SHORT: MACD < Signal (bearish momentum)
+
+        Args:
+            macd: MACD line value
+            signal: Signal line value
+            histogram: MACD histogram value
+            direction: Trade direction (LONG or SHORT)
+
+        Returns:
+            Tuple of (passes_filter, histogram_value)
+        """
+        if not self.MACD_ENABLED:
+            return True, 0.0
+
+        if pd.isna(macd) or pd.isna(signal):
+            return False, 0.0
+
+        if direction == "LONG":
+            # For LONG: MACD should be above signal
+            passes = macd > signal
+        else:
+            # For SHORT: MACD should be below signal
+            passes = macd < signal
+
+        return passes, histogram if not pd.isna(histogram) else 0.0
 
     def _check_ema_alignment(
         self, ema_7: float, ema_25: float, ema_99: float
@@ -99,6 +151,11 @@ class EmaRsiSwingSignal(BaseSignalGenerator):
     ) -> float:
         """Calculate signal confidence based on indicator strength.
 
+        Phase 1: 더 엄격한 신뢰도 계산
+        - Base를 0.55로 낮춤 (0.7에서)
+        - EMA 갭 기준을 3%로 상향 (2%에서)
+        - 추세 강도에 따른 단계별 보너스
+
         Args:
             ema_7: 7-period EMA value
             ema_25: 25-period EMA value
@@ -108,22 +165,34 @@ class EmaRsiSwingSignal(BaseSignalGenerator):
         Returns:
             Confidence score (0.0 to 1.0)
         """
-        # Base confidence
-        confidence = 0.7
+        # Phase 1: Base confidence를 낮춰 더 선별적으로
+        confidence = 0.55
 
-        # Bonus for strong EMA separation
+        # EMA 갭 기반 보너스 (더 엄격한 기준)
         ema_7_25_gap = abs(ema_7 - ema_25) / ema_25
         ema_25_99_gap = abs(ema_25 - ema_99) / ema_99
 
-        if ema_7_25_gap > 0.02:  # >2% gap
-            confidence += 0.1
-        if ema_25_99_gap > 0.02:
-            confidence += 0.1
-
-        # Bonus for RSI near 50 (most neutral)
-        rsi_distance_from_50 = abs(rsi - 50)
-        if rsi_distance_from_50 < 5:  # RSI 45-55
+        # 단계별 EMA 갭 보너스
+        if ema_7_25_gap > 0.05:  # >5% gap: 강한 추세
+            confidence += 0.15
+        elif ema_7_25_gap > 0.03:  # >3% gap: 중간 추세
+            confidence += 0.10
+        elif ema_7_25_gap > 0.02:  # >2% gap: 약한 추세
             confidence += 0.05
+
+        if ema_25_99_gap > 0.05:
+            confidence += 0.15
+        elif ema_25_99_gap > 0.03:
+            confidence += 0.10
+        elif ema_25_99_gap > 0.02:
+            confidence += 0.05
+
+        # RSI가 50에 가까울수록 보너스 (중립 영역)
+        rsi_distance_from_50 = abs(rsi - 50)
+        if rsi_distance_from_50 < 3:  # RSI 47-53: 가장 중립
+            confidence += 0.05
+        elif rsi_distance_from_50 < 5:  # RSI 45-55
+            confidence += 0.03
 
         return min(0.95, confidence)
 
@@ -182,8 +251,30 @@ class EmaRsiSwingSignal(BaseSignalGenerator):
             )
             return None
 
-        # Calculate confidence
+        # Phase 2: Check MACD momentum filter
+        macd = latest.get("macd", 0)
+        macd_signal = latest.get("macd_signal", 0)
+        macd_histogram = latest.get("macd_histogram", 0)
+
+        macd_passes, histogram_value = self._check_macd_momentum(
+            macd, macd_signal, macd_histogram, direction
+        )
+        if not macd_passes:
+            logger.debug(
+                "MACD filter rejected swing signal",
+                direction=direction,
+                macd=macd,
+                signal=macd_signal,
+            )
+            return None
+
+        # Calculate confidence (with MACD bonus)
         confidence = self._calculate_confidence(ema_7, ema_25, ema_99, rsi)
+
+        # MACD 보너스 추가 (히스토그램 강도)
+        if not pd.isna(histogram_value):
+            macd_bonus = min(abs(histogram_value) / 100, 0.05)
+            confidence = min(0.95, confidence + macd_bonus)
 
         # Calculate entry/exit prices
         entry_price = current_price
@@ -196,7 +287,7 @@ class EmaRsiSwingSignal(BaseSignalGenerator):
 
         reason = (
             f"EMA alignment: 7={ema_7:.2f}, 25={ema_25:.2f}, 99={ema_99:.2f} "
-            f"({direction.lower()} trend), RSI={rsi:.1f} in neutral zone"
+            f"({direction.lower()} trend), RSI={rsi:.1f}, MACD confirmed"
         )
 
         signal = Signal(

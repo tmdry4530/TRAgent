@@ -72,18 +72,25 @@ class WickReversalSignal(BaseSignalGenerator):
     - 안전장치: 손익비 1:2 도달 시 50% 익절
     """
 
-    # 상수
+    # 상수 - Phase 2 강화 (MACD 추가)
     EMA_PERIOD = 20
     RSI_PERIOD = 14
     ATR_PERIOD = 14  # ATR 계산 기간
-    RSI_OVERSOLD = 40  # 롱 진입 허용 RSI 상한
-    RSI_OVERBOUGHT = 60  # 숏 진입 허용 RSI 하한
-    VOLUME_MULTIPLIER = 2.0  # 진입용 거래량 배수
-    WICK_RATIO_THRESHOLD = 0.6  # 꼬리 비율 임계값 (60%)
+    RSI_OVERSOLD = 35  # 롱 진입 허용 RSI 상한 (40→35: 더 과매도만)
+    RSI_OVERBOUGHT = 65  # 숏 진입 허용 RSI 하한 (60→65: 더 과매수만)
+    VOLUME_MULTIPLIER = 5.0  # 진입용 거래량 배수 (2.0→5.0: 더 선별적)
+    WICK_RATIO_THRESHOLD = 0.75  # 꼬리 비율 임계값 (0.6→0.75: 강한 반전만)
     STOP_LOSS_BUFFER = 0.001  # 0.1% 손절 버퍼 (ATR 사용 안할 때)
     ATR_SL_MULTIPLIER = 1.5  # ATR x 1.5 = Stop Loss
     ATR_TP_MULTIPLIER = 3.0  # ATR x 3.0 = Take Profit (RR 1:2)
     MAX_CANDLES = 100  # 최대 캔들 저장 수
+    MIN_CONFIDENCE = 0.65  # 최소 신뢰도 임계값
+
+    # Phase 2: MACD 설정
+    MACD_FAST = 12
+    MACD_SLOW = 26
+    MACD_SIGNAL = 9
+    MACD_ENABLED = True  # MACD 필터 활성화
 
     def __init__(
         self,
@@ -266,6 +273,93 @@ class WickReversalSignal(BaseSignalGenerator):
                 )
 
         return passes, rsi
+
+    def _calculate_macd(
+        self, candles: list[CandleData]
+    ) -> tuple[Optional[float], Optional[float], Optional[float]]:
+        """Calculate MACD indicator from candles.
+
+        MACD = EMA(12) - EMA(26)
+        Signal = EMA(9) of MACD
+        Histogram = MACD - Signal
+
+        Args:
+            candles: List of candles
+
+        Returns:
+            Tuple of (macd, signal, histogram) or (None, None, None) if insufficient data
+        """
+        min_required = self.MACD_SLOW + self.MACD_SIGNAL
+        if len(candles) < min_required:
+            return None, None, None
+
+        closes = [c.close for c in candles[-(min_required + 10):]]
+        if len(closes) < min_required:
+            return None, None, None
+
+        df = pd.DataFrame({"close": closes})
+
+        # Calculate EMAs
+        ema_fast = df["close"].ewm(span=self.MACD_FAST, adjust=False).mean()
+        ema_slow = df["close"].ewm(span=self.MACD_SLOW, adjust=False).mean()
+
+        # MACD line
+        macd_line = ema_fast - ema_slow
+
+        # Signal line
+        signal_line = macd_line.ewm(span=self.MACD_SIGNAL, adjust=False).mean()
+
+        # Histogram
+        histogram = macd_line - signal_line
+
+        return float(macd_line.iloc[-1]), float(signal_line.iloc[-1]), float(histogram.iloc[-1])
+
+    def _check_macd_momentum(
+        self, candles: list[CandleData], direction: str
+    ) -> tuple[bool, float]:
+        """Check if MACD confirms the trade direction.
+
+        For LONG: MACD > Signal (bullish momentum)
+        For SHORT: MACD < Signal (bearish momentum)
+
+        Args:
+            candles: List of candles
+            direction: Trade direction (LONG or SHORT)
+
+        Returns:
+            Tuple of (passes_filter, macd_histogram)
+        """
+        if not self.MACD_ENABLED:
+            return True, 0.0
+
+        macd, signal, histogram = self._calculate_macd(candles)
+
+        if macd is None or signal is None:
+            logger.debug("Insufficient data for MACD calculation")
+            return False, 0.0
+
+        if direction == "LONG":
+            # For LONG: MACD should be above signal (bullish) or crossing up
+            passes = macd > signal or histogram > 0
+            if not passes:
+                logger.debug(
+                    "MACD filter blocked LONG",
+                    macd=macd,
+                    signal=signal,
+                    histogram=histogram,
+                )
+        else:
+            # For SHORT: MACD should be below signal (bearish) or crossing down
+            passes = macd < signal or histogram < 0
+            if not passes:
+                logger.debug(
+                    "MACD filter blocked SHORT",
+                    macd=macd,
+                    signal=signal,
+                    histogram=histogram,
+                )
+
+        return passes, histogram if histogram else 0.0
 
     def _calculate_atr(self, candles: list[CandleData], period: int = 14) -> Optional[float]:
         """Calculate Average True Range (ATR) from candles.
@@ -553,7 +647,17 @@ class WickReversalSignal(BaseSignalGenerator):
             )
             return None
 
-        # 6. Calculate entry/exit prices
+        # 6. Phase 2: Check MACD momentum filter
+        macd_passes, macd_histogram = self._check_macd_momentum(candles_1m, direction)
+        if not macd_passes:
+            logger.debug(
+                "MACD filter rejected signal",
+                direction=direction,
+                histogram=macd_histogram,
+            )
+            return None
+
+        # 7. Calculate entry/exit prices
         entry_price = current_price
 
         # Calculate ATR for dynamic SL/TP
@@ -580,12 +684,32 @@ class WickReversalSignal(BaseSignalGenerator):
                 risk = stop_loss - entry_price
                 take_profit = entry_price - (risk * 2)
 
-        # Calculate confidence based on wick strength and volume
+        # Calculate confidence based on wick strength, volume, RSI, and MACD
         wick_strength = max(lower_ratio, upper_ratio)
         volume_ratio = latest_candle.volume / (
             sum(c.volume for c in candles_1m[-21:-1]) / 20
         )
-        confidence = min(0.9, 0.5 + (wick_strength * 0.3) + (min(volume_ratio / 10, 0.1)))
+
+        # Phase 2: 신뢰도 계산 (MACD 추가)
+        # Base: 0.5
+        # Wick strength bonus: 0 ~ 0.20
+        # Volume bonus: 0 ~ 0.10
+        # RSI bonus: 0 ~ 0.10
+        # MACD bonus: 0 ~ 0.10 (히스토그램 강도)
+        base_confidence = 0.5
+        wick_bonus = wick_strength * 0.20
+        volume_bonus = min(volume_ratio / 20, 0.10)
+
+        # RSI 극단값 보너스 (더 과매도/과매수일수록 높음)
+        if direction == "LONG":
+            rsi_bonus = max(0, (35 - rsi_value) / 350)  # RSI 0에서 0.1
+        else:
+            rsi_bonus = max(0, (rsi_value - 65) / 350)  # RSI 100에서 0.1
+
+        # MACD 히스토그램 보너스 (강할수록 높음)
+        macd_bonus = min(abs(macd_histogram) * 100, 0.10) if macd_histogram else 0
+
+        confidence = min(0.95, base_confidence + wick_bonus + volume_bonus + rsi_bonus + macd_bonus)
 
         # Create signal context for position management
         self._last_signal_context = WickSignalContext(

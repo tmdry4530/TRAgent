@@ -6,6 +6,7 @@ from src.signals.scalp import (
     WickReversalSignal,
     WickSignalContext,
 )
+from src.signals.high_wr import HighWinRateSignalGenerator
 
 __all__ = [
     "Signal",
@@ -13,4 +14,5 @@ __all__ = [
     "CandleData",
     "WickReversalSignal",
     "WickSignalContext",
+    "HighWinRateSignalGenerator",
 ]
